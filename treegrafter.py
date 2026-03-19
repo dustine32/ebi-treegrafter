@@ -25,7 +25,7 @@ class ReMatcher:
         return self.rematch.group(i)
 
 
-def process_matches_epang(matches, datadir, tempdir, binary=None, threads=1):
+def process_matches_epang(matches, datadir, tempdir, binary=None, threads=1, print_go=False):
     results = {}
 
     for pthr in matches:
@@ -37,7 +37,7 @@ def process_matches_epang(matches, datadir, tempdir, binary=None, threads=1):
 
         # print out the pthr Family matches
         for query_id in matches[pthr]:
-            results[query_id] = [
+            row = [
                 query_id,
                 pthr,
                 matches[pthr][query_id]['score'][0],
@@ -52,6 +52,9 @@ def process_matches_epang(matches, datadir, tempdir, binary=None, threads=1):
                 matches[pthr][query_id]['envto'][0],
                 "-"
             ]
+            if print_go:
+                row.extend(['-', '-'])
+            results[query_id] = row
 
         result_tree = _run_epang(pthr, query_fasta_file, datadir, tempdir,
                                  binary=binary, threads=threads)
@@ -59,7 +62,7 @@ def process_matches_epang(matches, datadir, tempdir, binary=None, threads=1):
             # EPA-ng error (e.g tree cannot be converted to unrooted)
             continue
 
-        for result in process_tree(pthr, result_tree, matches[pthr], datadir):
+        for result in process_tree(pthr, result_tree, matches[pthr], datadir, print_go=print_go):
             query_id = result[0]
             results[query_id] = result
 
@@ -172,7 +175,7 @@ def _run_epang(pthr, query_fasta, datadir, tempdir, binary=None, threads=1):
     return None
 
 
-def process_tree(pthr, result_tree, pthr_matches, datadir):
+def process_tree(pthr, result_tree, pthr_matches, datadir, print_go=False):
     with open(result_tree, "rt") as classification:
         classification_json = json.load(classification)
 
@@ -212,9 +215,9 @@ def process_tree(pthr, result_tree, pthr_matches, datadir):
 
         annot_file = os.path.join(datadir, 'PAINT_Annotations', pthr + '.json')
         with open(annot_file, 'rt') as fh:
-            pthrsf, _, _, _ = json.load(fh)[common_an]
+            pthrsf, go_terms, protein_class, _ = json.load(fh)[common_an]
 
-        results_pthr.append([
+        row = [
             query_id,
             pthrsf or pthr,
             pthr_matches[query_id]['score'][0],
@@ -228,7 +231,11 @@ def process_tree(pthr, result_tree, pthr_matches, datadir):
             pthr_matches[query_id]['envfrom'][0],
             pthr_matches[query_id]['envto'][0],
             common_an
-        ])
+        ]
+        if print_go:
+            row.append(go_terms or '-')
+            row.append(protein_class or '-')
+        results_pthr.append(row)
 
     return results_pthr
 
@@ -580,14 +587,18 @@ def run(args):
     else:
         fh = open(args.output, "wt")
 
-    fh.write("query_id\tpanther_id\tscore\tevalue\tdom_score\tdom_evalue\t"
-             "hmm_start\thmm_end\tali_start\tali_end\tenv_start\tenv_end\t"
-             "node_id\n")
+    header = ("query_id\tpanther_id\tscore\tevalue\tdom_score\tdom_evalue\t"
+              "hmm_start\thmm_end\tali_start\tali_end\tenv_start\tenv_end\t"
+              "node_id")
+    if args.print_go:
+        header += "\tgo_terms\tprotein_class"
+    fh.write(header + "\n")
 
     try:
         results = process_matches_epang(matches, args.datadir, tempdir,
                                         binary=args.epang,
-                                        threads=args.threads)
+                                        threads=args.threads,
+                                        print_go=args.print_go)
 
         for hit in results:
             fh.write("\t".join(map(str, hit)) + "\n")
@@ -629,6 +640,8 @@ protein sequences, using annotated phylogenetic trees.
                             default=tempfile.gettempdir())
     parser_run.add_argument("--keep", action="store_true",
                             help="keep temporary directory")
+    parser_run.add_argument("--print-go", action="store_true",
+                            help="include GO terms and protein class in output")
     parser_run.set_defaults(func=run)
 
     args = parser.parse_args()
