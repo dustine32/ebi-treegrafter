@@ -103,51 +103,48 @@ def stringify(query_id):
 
 
 def _querymsf(match_data, pthr_align_length):
-    # matchdata contains: hmmstart, hmmend, hmmalign and matchalign,
-    # as arrays (multiple modules possible)
+    # Pre-allocate output as fixed-length gap array
+    querymsf = ['-'] * pthr_align_length
 
-    # N-terminaly padd the sequence
-    # position 1 until start is filled with '-'
+    # Track which HMM positions are already claimed
+    used_positions = set()
 
-    querymsf = ((int(match_data['hmmstart'][0]) - 1) * '-')
+    # Sort domain indices by score (highest first)
+    num_domains = len(match_data['matchalign'])
+    domain_indices = list(range(num_domains))
+    domain_indices.sort(
+        key=lambda i: float(match_data['domscore'][i]), reverse=True
+    )
 
-    # loop the elements/domains
-    for i in range(0, len(match_data['matchalign'])):
+    for i in domain_indices:
+        hmmstart = int(match_data['hmmstart'][i])
+        hmmend = int(match_data['hmmend'][i])
 
-        # if this is not the first element, fill in the gap between the hits
-        if i > 0:
-            start = int(match_data['hmmstart'][i])
-            end = int(match_data['hmmend'][i-1])
-            # This bridges the query_id gap between the hits
-            querymsf += (start - end - 1) * '-'
+        # Check for overlap with already-claimed positions
+        domain_positions = set(range(hmmstart, hmmend + 1))
+        if domain_positions & used_positions:
+            sys.stderr.write(
+                "Warning: domain {} (score {}) overlaps higher-scoring "
+                "domain, skipping.\n".format(i, match_data['domscore'][i])
+            )
+            continue
 
-        # extract the query string
-        matchalign = match_data['matchalign'][i]
+        # Mark positions as used
+        used_positions |= domain_positions
+
+        # Place alignment characters at correct MSA positions
         hmmalign = match_data['hmmalign'][i]
+        matchalign = match_data['matchalign'][i]
+        msa_pos = hmmstart - 1  # convert to 0-based
 
-        # loop the sequence
-        for j in range(0, len(hmmalign)):
-            # hmm insert state
-            if hmmalign[j:j+1] == ".":
+        for j in range(len(hmmalign)):
+            if hmmalign[j] == '.':
+                # Insert state — skip, don't advance MSA position
                 continue
+            querymsf[msa_pos] = matchalign[j]
+            msa_pos += 1
 
-            querymsf += matchalign[j:j+1]
-
-    # C-terminaly padd the sequence
-    # get the end of the last element/domain
-    last_end = int(match_data['hmmend'][-1])
-    # and padd out to fill the msf length
-    querymsf += (pthr_align_length - last_end) * '-'
-
-    # error check (is this required?)
-    if len(querymsf) != pthr_align_length:
-        # then something is wrong
-        sys.stderr.write("Error: length of query MSF longer than expected "
-                         "PANTHER alignment length: expected {}, "
-                         "got {}.\n".format(pthr_align_length, len(querymsf)))
-        sys.exit(1)
-
-    return querymsf.upper()
+    return ''.join(querymsf).upper()
 
 
 def _run_epang(pthr, query_fasta, datadir, tempdir, binary=None, threads=1):
@@ -369,35 +366,68 @@ def parsehmmsearch(hmmer_out):
                 domain_num = m.group(1)
 
                 if domain_num in store_domain:
-                    line = fp.readline()
-                    hmmalign_array = line.split()
+                    hmmalign_seq = ''
+                    matchlign_seq = ''
+                    hmmalign_model = None
+                    matchalign_query = None
 
-                    hmmalign_model = hmmalign_array[0]
-                    hmmalign_model = re.sub(r'\..+', '', hmmalign_model)
-                    hmmalign_seq = hmmalign_array[2]
+                    # Read all alignment blocks for this domain.
+                    # HMMER3 outputs 4 lines per block:
+                    #   1. HMM sequence line (e.g. "PTHR00001.1  1 abcde 5")
+                    #   2. Consensus/match line
+                    #   3. Query sequence line (e.g. "query1  1 ABCDE 5")
+                    #   4. PP (posterior probability) line
+                    # Blocks are separated by a blank line.
+                    while True:
+                        # Read HMM line (line 1 of block)
+                        line = fp.readline()
+                        if not line or not line.strip():
+                            break
+                        hmmalign_array = line.split()
+                        if len(hmmalign_array) < 3:
+                            break
 
-                    line = fp.readline()
-                    line = fp.readline()
+                        # On continuation blocks, verify model name matches
+                        block_model = re.sub(r'\..+', '', hmmalign_array[0])
+                        if hmmalign_model is not None:
+                            if block_model != hmmalign_model:
+                                break  # not a continuation — stop
+                        else:
+                            hmmalign_model = block_model
+                        hmmalign_seq += hmmalign_array[2]
 
-                    matchalign_array = line.split()
+                        fp.readline()            # consensus line (line 2)
+                        line = fp.readline()      # query line (line 3)
 
-                    matchalign_query = matchalign_array[0]
-                    matchalign_query = stringify(matchalign_query)
+                        matchalign_array = line.split()
+                        if matchalign_query is None:
+                            matchalign_query = stringify(matchalign_array[0])
+                        matchlign_seq += matchalign_array[2]
 
-                    matchlign_seq = matchalign_array[2]
+                        fp.readline()            # PP line (line 4)
+                        fp.readline()            # blank separator between blocks
 
-                    if matchpthr == hmmalign_model and query_id == matchalign_query:
-                        if len(current_match['align']['hmmalign']) >= len(current_match['align']['hmmstart']):
-                            sys.stderr.write("Trying to add alignment sequence"
-                                             " without additional data.\n")
-                            sys.exit(1)
+                    # `line` now holds the first non-block line (next section
+                    # or blank). The outer while-loop will process it via
+                    # m = ReMatcher(line) at the top, so we must NOT read
+                    # another line at the bottom of the outer loop.
 
-                        current_match['align']['hmmalign'].append(hmmalign_seq)
-                        current_match['align']['matchalign'].append(matchlign_seq)
+                    if hmmalign_model and matchalign_query:
+                        if matchpthr == hmmalign_model and query_id == matchalign_query:
+                            if len(current_match['align']['hmmalign']) >= len(current_match['align']['hmmstart']):
+                                sys.stderr.write("Trying to add alignment sequence"
+                                                 " without additional data.\n")
+                                sys.exit(1)
+
+                            current_match['align']['hmmalign'].append(hmmalign_seq)
+                            current_match['align']['matchalign'].append(matchlign_seq)
 
                     match_store[query_id] = current_match
 
-                line = fp.readline()
+                    continue  # skip bottom-of-loop readline; line already set
+
+                # domain_num not in store_domain — just let the outer loop
+                # advance via its bottom-of-loop readline
 
             elif m.match(r'\A\/\/'):
                 score_store = {}
